@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
 
+import 'package:archive/archive.dart' show getCrc32;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' hide Image, Texture;
@@ -281,26 +282,31 @@ Future<void> generateOTR(Tuple5<HashMap<String, StageEntry>, String, SendPort, b
           }
         }
 
-        // A few at a time; a whole pack of decoded art doesn't fit in memory.
-        final batch = Platform.numberOfProcessors;
-        for (var i = 0; i < work.length; i += batch) {
-          final textures = await Future.wait(
-            work.sublist(i, min(i + batch, work.length)).map(
-              (group) => compute(
-                processTextureEntry,
-                Tuple3(entry.key, group, params.item4),
-              ),
-            ),
-          );
-          for (final texture in textures) {
+        // A few at a time; a whole pack of decoded art doesn't fit in memory. Each one
+        // is written as it finishes, so a big texture doesn't hold up the others.
+        final deflate = compress && arcFile.isZip;
+        final inFlight = <Future<void>>{};
+        for (final group in work) {
+          while (inFlight.length >= Platform.numberOfProcessors) {
+            await Future.any(inFlight);
+          }
+          late final Future<void> job;
+          job = compute(
+            processTextureDeflated,
+            Tuple4(entry.key, group, params.item4, deflate),
+          ).then((texture) {
             if (texture.item2 == null) {
               params.item3.send('Failed to process texture ${texture.item1}');
+            } else if (deflate) {
+              arcFile.addDeflated(texture.item1, texture.item2!, texture.item3, texture.item4);
             } else {
               arcFile.addFile(texture.item1, texture.item2!, compress: compress);
             }
             params.item3.send(1);
-          }
+          }).whenComplete(() => inFlight.remove(job));
+          inFlight.add(job);
         }
+        await Future.wait(inFlight);
         // A grouped texture reported one step instead of one per image.
         if (pairs.length > work.length) {
           params.item3.send(pairs.length - work.length);
@@ -314,6 +320,19 @@ Future<void> generateOTR(Tuple5<HashMap<String, StageEntry>, String, SendPort, b
   }
 
   Isolate.exit();
+}
+
+// Deflated on the worker with native zlib.
+Future<Tuple4<String, Uint8List?, int, int>> processTextureDeflated(
+  Tuple4<String, List<Tuple2<File, TextureManifestEntry>>, bool, bool> params,
+) async {
+  final texture = await processTextureEntry(Tuple3(params.item1, params.item2, params.item3));
+  final data = texture.item2;
+  if (data == null || !params.item4) {
+    return Tuple4(texture.item1, data, 0, 0);
+  }
+  final deflated = Uint8List.fromList(ZLibEncoder(raw: true).convert(data));
+  return Tuple4(texture.item1, deflated, data.length, getCrc32(data));
 }
 
 Future<Tuple2<String, Uint8List?>> processTextureEntry(
@@ -545,7 +564,7 @@ Uint8List? buildTextureFromImage(
   }
 
   texture.textureType = entry.textureType;
-  texture.isPalette = image.hasPalette && (texture.textureType == TextureType.Palette4bpp || texture.textureType == TextureType.Palette8bpp);
+  texture.isPalette = image.hasPalette && fitsPaletteFormat(image, texture.textureType);
 
   final isNotOriginalSize = entry.textureWidth != image.width ||
       entry.textureHeight != image.height;
@@ -619,6 +638,19 @@ Tuple2<int, int> wholeMultiple(int width, int height, TextureManifestEntry entry
   final kx = max(1, (width / entry.textureWidth).round());
   final ky = max(1, (height / entry.textureHeight).round());
   return Tuple2(kx * entry.textureWidth, ky * entry.textureHeight);
+}
+
+bool fitsPaletteFormat(Image image, TextureType type) {
+  if (type != TextureType.Palette4bpp && type != TextureType.Palette8bpp) {
+    return false;
+  }
+  final limit = type == TextureType.Palette4bpp ? 16 : 256;
+  for (final pixel in image) {
+    if (pixel.index >= limit) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // I and IA hold grey only, and I draws its brightness as alpha.
